@@ -1,0 +1,61 @@
+name: Update GOES Fire Data (ABI FDC)
+
+# CADENCE: self-re-dispatching loop + schedule safety net (same pattern proven
+# on firestorm-lightning-data 2026-05-31). GitHub Actions `schedule` is
+# best-effort and throttled to ~hourly on free runners regardless of the cron
+# expression. FDCC publishes a fresh granule every ~5 min, so to actually track
+# it we run an INTERNAL loop (fetch every ~90s for ~5 min) and RE-DISPATCH self
+# via workflow_dispatch, keeping the */5 schedule only as a dead-man restart.
+#
+# Public repo → unlimited free GHA minutes. Degrades gracefully to schedule-only
+# if the self-dispatch is ever rate-limited.
+on:
+  schedule:
+    - cron: '*/5 * * * *'        # dead-man restart only; real cadence is the self-loop
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write                 # self re-dispatch
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: update-goes-fire
+      cancel-in-progress: false
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install boto3 botocore netCDF4 numpy
+
+      - name: Fetch FDC in a ~5-min loop (~90s cadence)
+        run: |
+          git config user.name  'firestorm-bot'
+          git config user.email 'firestorm-bot@users.noreply.github.com'
+          for i in 1 2 3 4; do
+            echo "=== fetch iteration $i/4 ($(date -u +%H:%M:%S)Z) ==="
+            python fetch_fdc.py || echo "iteration $i fetch failed (continuing)"
+            git add data/goes_fire.json
+            if git diff --cached --quiet; then
+              echo 'No change this iteration'
+            else
+              git commit -m "goes-fire update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              git pull --rebase --autostash origin main || true
+              git push || echo "push failed iteration $i (retry next)"
+            fi
+            if [ "$i" -lt 4 ]; then sleep 90; fi
+          done
+
+      - name: Re-dispatch self
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run update-goes-fire.yml --ref main || echo "re-dispatch failed; schedule will restart the chain"
