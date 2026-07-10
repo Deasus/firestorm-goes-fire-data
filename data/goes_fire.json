@@ -1,1 +1,1 @@
-{"generated_at":"2026-07-10T11:39:00Z","newest_granule":"2026-07-10T11:31:18Z","product":"GOES-R ABI L2 FDC (Fire/Hot Spot Characterization), CONUS sector, 2km","counts":{"total":0,"g19":0,"g18":0},"detections":[]}
+{"generated_at":"2026-07-10T11:40:33Z","newest_granule":"2026-07-10T11:36:18Z","product":"GOES-R ABI L2 FDC (Fire/Hot Spot Characterization), CONUS sector, 2km","counts":{"total":1,"g19":0,"g18":1},"detections":[{"lat":38.2151,"lng":-107.5572,"tier":"good","sat":"G18","age_sec":255,"frp":41.0,"tempK":400.5}]}
