@@ -1,6 +1,6 @@
 # firestorm-goes-fire-data
 
-National, continuous wildfire detection for [FIRESTORM](https://github.com/Deasus/Firestorm) from the
+National, continuous wildfire detection for [FIRESTORM](https://github.com/Deasus/firestorm-platform) from the
 **GOES-R ABI Level-2 Fire / Hot Spot Characterization (FDC)** product.
 
 ## Why
