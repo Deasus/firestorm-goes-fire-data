@@ -30,10 +30,13 @@ WHAT FDC IS (and isn't):
     aircraft IR perimeter mapping.
 
 OUTPUT: data/goes_fire.json
-Shape: { "generated_at": ISO8601,
-         "window_minutes": N,           # how far back we scanned
+Shape: { "generated_at": ISO8601, "newest_granule": ISO8601, "oldest_granule": ISO8601,
+         "window_minutes": N, "window_scans": S,      # rolling window actually merged
          "counts": {"total": N, "g19": N19, "g18": N18},
-         "detections": [ {lat,lng,frp,tempK,tier,sat,age_sec}, ... ] }
+         "detections": [ {lat,lng,frp,tempK,tier,sat,age_sec,first_seen_sec,scans}, ... ] }
+  age_sec = most recent sighting · first_seen_sec = oldest sighting in the window ·
+  scans = how many scans (either satellite) saw this ~3 km cell. lat/lng/frp/tempK/tier/sat
+  come from the strongest (max-FRP) sighting.
 
 SOURCE (public, anonymous, no auth, no egress charge — same NODD program as GLM):
   s3://noaa-goes19/ABI-L2-FDCC/<YYYY>/<DDD>/<HH>/*.nc   (East/CONUS)
@@ -56,15 +59,19 @@ import netCDF4
 import numpy as np
 
 # ── Config ───────────────────────────────────────────────────────────
-# Scan window: how many recent granules to consider. FDCC publishes ~1 granule
-# every 5 min. We take the SINGLE most-recent granule per satellite (a full
-# snapshot of all current fire pixels) rather than accumulating — FDC is a
-# current-state product, not an event stream like GLM. The window is only used
-# to find the newest file across a possible hour boundary.
-LOOKBACK_HOURS = 2          # search this many hours back to find the newest granule
+# ROLLING WINDOW (2026-10-05). This used to publish only the SINGLE newest granule per
+# satellite. On a quiet morning that showed 1 detection nationwide, while NGFS (30-min
+# lookback) showed 15, and a fire that dipped below detection for one 5-min scan vanished
+# and reappeared. We now merge the newest WINDOW_SCANS granules per satellite: ~30 min at
+# the 5-min CONUS cadence. Replayed on 2026-10-05 13:26Z: 1 scan -> 1 location, 6 scans -> 4.
+WINDOW_SCANS = int(os.environ.get("FDC_WINDOW_SCANS", "6"))
+# Decoded granules are cached here, so the workflow's 4-iteration loop downloads only the
+# NEW granule (~1 per satellite) each iteration instead of all 12.
+CACHE_DIR = os.environ.get("FDC_CACHE_DIR", "/tmp/fdc_cache")
+LOOKBACK_HOURS = 2          # search this many hours back for the window's granules
 SATS = [("noaa-goes19", "G19", "g19"), ("noaa-goes18", "G18", "g18")]
 PRODUCT_PREFIX = "ABI-L2-FDCC"     # CONUS sector
-OUT_PATH = os.path.join(os.path.dirname(__file__), "data", "goes_fire.json")
+OUT_PATH = os.environ.get("FDC_OUT_PATH") or os.path.join(os.path.dirname(__file__), "data", "goes_fire.json")
 
 # GOES FDC Mask flag_values → a coarse confidence tier we surface to the
 # frontend. (Full meanings verified from the live granule's flag_meanings attr.)
@@ -90,10 +97,10 @@ S3 = boto3.client(
 )
 
 
-def _newest_granule_key(bucket: str) -> str | None:
-    """Find the most recent FDCC .nc key across the lookback window."""
+def _newest_granule_keys(bucket: str, n: int) -> list[str]:
+    """The n most recent FDCC .nc keys (oldest first), across hour boundaries."""
     now = datetime.now(timezone.utc)
-    best = None
+    found: list[str] = []
     for h in range(LOOKBACK_HOURS + 1):
         t = now - timedelta(hours=h)
         prefix = f"{PRODUCT_PREFIX}/{t.year}/{t.timetuple().tm_yday:03d}/{t.hour:02d}/"
@@ -109,11 +116,33 @@ def _newest_granule_key(bucket: str) -> str | None:
                 token = r.get("NextContinuationToken")
             else:
                 break
-        if keys:
-            # filenames sort lexically == chronologically (start-time encoded)
-            best = max(keys)
-            break  # newest hour with data wins
-    return best
+        # filenames sort lexically == chronologically (start-time encoded)
+        found = sorted(keys) + found
+        if len(found) >= n:
+            break
+    return found[-n:]
+
+
+def _granule(bucket: str, key: str, sat_label: str, now: datetime):
+    """Decoded (records, scan-start) for one granule, via the per-job cache."""
+    path = os.path.join(CACHE_DIR, key.replace("/", "_") + ".json")
+    if os.path.exists(path):
+        with open(path) as f:
+            c = json.load(f)
+        gen = datetime.strptime(c["gen"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        age = int((now - gen).total_seconds())
+        for r in c["recs"]:
+            r["age_sec"] = age
+        return c["recs"], gen
+    raw = S3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    recs, gen = _decode(raw, sat_label, now)
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"gen": gen.strftime("%Y-%m-%dT%H:%M:%SZ"), "recs": recs}, f)
+    except OSError:
+        pass
+    return recs, gen
 
 
 def _geo_latlon(proj, x_rad: np.ndarray, y_rad: np.ndarray):
@@ -189,50 +218,68 @@ def _decode(raw: bytes, sat_label: str, now: datetime):
 
 def main() -> int:
     now = datetime.now(timezone.utc)
-    detections = []
     counts = {}
-    newest_gen = None
+    newest_gen = oldest_gen = None
+    cells: dict = {}
     for bucket, sat_label, count_key in SATS:
         try:
-            key = _newest_granule_key(bucket)
-            if not key:
+            keys = _newest_granule_keys(bucket, WINDOW_SCANS)
+            if not keys:
                 print(f"[{sat_label}] no recent FDCC granule found", file=sys.stderr)
                 counts[count_key] = 0
                 continue
-            obj = S3.get_object(Bucket=bucket, Key=key)
-            raw = obj["Body"].read()
-            recs, gen = _decode(raw, sat_label, now)
-            detections.extend(recs)
-            counts[count_key] = len(recs)
-            if newest_gen is None or gen > newest_gen:
-                newest_gen = gen
-            print(f"[{sat_label}] {key.split('/')[-1]} -> {len(recs)} kept detections")
+            sat_cells = set()
+            for key in keys:
+                recs, gen = _granule(bucket, key, sat_label, now)
+                newest_gen = gen if newest_gen is None or gen > newest_gen else newest_gen
+                oldest_gen = gen if oldest_gen is None or gen < oldest_gen else oldest_gen
+                for d in recs:
+                    # one record per ~3 km cell (~1.5 FDC pixels): also de-dups the G19/G18
+                    # overlap over the central US
+                    k = (round(d["lat"] / 0.03), round(d["lng"] / 0.03))
+                    sat_cells.add(k)
+                    c = cells.get(k)
+                    if c is None:
+                        cells[k] = {**d, "first_seen_sec": d["age_sec"], "_scans": {(sat_label, key)}}
+                        continue
+                    c["_scans"].add((sat_label, key))
+                    c["first_seen_sec"] = max(c["first_seen_sec"], d["age_sec"])
+                    last = min(c["age_sec"], d["age_sec"])
+                    if d.get("frp", 0) > c.get("frp", 0):      # show the strongest sighting
+                        for f in ("lat", "lng", "frp", "tempK", "tier", "sat"):
+                            if f in d:
+                                c[f] = d[f]
+                            else:
+                                c.pop(f, None)
+                    c["age_sec"] = last                         # but date it by the latest
+            counts[count_key] = len(sat_cells)
+            print(f"[{sat_label}] {len(keys)} granules {keys[0].split('_s')[-1][:13]}..{keys[-1].split('_s')[-1][:13]}"
+                  f" -> {len(sat_cells)} cells")
         except Exception as e:  # one satellite failing must not kill the other
             print(f"[{sat_label}] ERROR: {e}", file=sys.stderr)
             counts[count_key] = 0
 
-    # De-dup G19/G18 overlap (central US sees both): keep the higher-FRP hit
-    # within ~0.03 deg (~3 km, ~1.5 FDC pixels). Cheap grid-bucket dedup.
-    seen = {}
-    for d in sorted(detections, key=lambda r: -(r.get("frp", 0))):
-        k = (round(d["lat"] / 0.03), round(d["lng"] / 0.03))
-        if k not in seen:
-            seen[k] = d
-    deduped = list(seen.values())
+    detections = []
+    for c in sorted(cells.values(), key=lambda r: -(r.get("frp", 0))):
+        c["scans"] = len(c.pop("_scans"))
+        detections.append(c)
+    window_min = (round((newest_gen - oldest_gen).total_seconds() / 60) + 5) if newest_gen else 0
 
     payload = {
         "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "newest_granule": (newest_gen.strftime("%Y-%m-%dT%H:%M:%SZ") if newest_gen else None),
+        "oldest_granule": (oldest_gen.strftime("%Y-%m-%dT%H:%M:%SZ") if oldest_gen else None),
+        "window_minutes": window_min,
+        "window_scans": WINDOW_SCANS,
         "product": "GOES-R ABI L2 FDC (Fire/Hot Spot Characterization), CONUS sector, 2km",
-        "counts": {"total": len(deduped), **counts},
-        "detections": deduped,
+        "counts": {"total": len(detections), **counts},
+        "detections": detections,
     }
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     with open(OUT_PATH, "w") as f:
         json.dump(payload, f, separators=(",", ":"))
-    print(f"wrote {OUT_PATH}: {len(deduped)} detections "
-          f"(G19={counts.get('g19',0)}, G18={counts.get('g18',0)}), "
-          f"newest granule {payload['newest_granule']}")
+    print(f"wrote {OUT_PATH}: {len(detections)} detections over {window_min} min "
+          f"(G19={counts.get('g19',0)}, G18={counts.get('g18',0)}), newest granule {payload['newest_granule']}")
     return 0
 
 
